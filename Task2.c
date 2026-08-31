@@ -1,282 +1,452 @@
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file      startup_stm32f051x8.s
-  * @author    MCD Application Team
-  * @brief     STM32F051x4/STM32F051x6/STM32F051x8 devices vector table for GCC toolchain.
-  *            This module performs:
-  *                - Set the initial SP
-  *                - Set the initial PC == Reset_Handler,
-  *                - Set the vector table entries with the exceptions ISR address
-  *                - Branches to main in the C library (which eventually
-  *                  calls main()).
-  *            After Reset the Cortex-M0 processor is in Thread mode,
-  *            priority is Privileged, and the Stack is set to Main.
-  ******************************************************************************
-  * @attention
+  * EEE3096S 2026 - Practical 1B
+  * Tasks 2 and 3: fast integer square root, TIM16 timing, optimisation flags
   *
-  * Copyright (c) 2016 STMicroelectronics.
-  * All rights reserved.
+  * Student 1 : Bokani Makhwaje <MKHBOK008>
+  * Student 2 : Valencia Phiri  <PHRVAL001>
+  * Date      : <24/08/2026>
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * Board pins used
+  *   PC13 : scope pulse. Driven LOW for the timed section, HIGH otherwise.
+  *          Broken out on Header P1.
+  *   PB1  : pass or fail indicator. User LED 1. ON means all ten golden
+  *          values matched.
   *
+  * Search for TODO. Every TODO is a piece of work you have to complete.
+  * Do not delete the USER CODE markers. STM32CubeIDE overwrites everything
+  * outside them whenever you regenerate from the .ioc file.
   ******************************************************************************
   */
+/* USER CODE END Header */
 
-  .syntax unified
-  .cpu cortex-m0
-  .fpu softvfp
-  .thumb
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
 
-.global g_pfnVectors
-.global Default_Handler
+/* USER CODE BEGIN Includes */
+#include <stdint.h>
+#include <inttypes.h>
+/* USER CODE END Includes */
 
-/* start address for the initialization values of the .data section.
-defined in linker script */
-.word _sidata
-/* start address for the .data section. defined in linker script */
-.word _sdata
-/* end address for the .data section. defined in linker script */
-.word _edata
-/* start address for the .bss section. defined in linker script */
-.word _sbss
-/* end address for the .bss section. defined in linker script */
-.word _ebss
+/* USER CODE BEGIN PD */
+#define PULSE_PIN    13u          /* PC13 */
+#define LED_PIN      1u           /* PB1  */
+#define DEBUG_LED_PIN 5u          /* PB5  */
 
-  .section .text.Reset_Handler
-  .weak Reset_Handler
-  .type Reset_Handler, %function
-Reset_Handler:
-  ldr   r0, =_estack
-  mov   sp, r0          /* set stack pointer */
-  
-  /* Call the clock system initialization function.*/
-  bl  SystemInit
+#define TEST_INPUT   987654321u   /* the input named in the Task 2 question */
+#define LONG_RUN_N   100u       /* calls in the wrap-around run           */
+/* USER CODE END PD */
 
-/* Copy the data segment initializers from flash to SRAM */
-  ldr r0, =_sdata
-  ldr r1, =_edata
-  ldr r2, =_sidata
-  movs r3, #0
-  b LoopCopyDataInit
+/* USER CODE BEGIN PV */
 
-CopyDataInit:
-  ldr r4, [r2, r3]
-  str r4, [r0, r3]
-  adds r3, r3, #4
+/* The ten inputs from Task 1. Do not change these. */
+static const uint32_t golden_inputs[10] = {
+    0u, 1u, 15u, 16u, 4095u, 65535u,
+    123456789u, 987654321u, 4294836225u, 4294967295u
+};
 
-LoopCopyDataInit:
-  adds r4, r0, r3
-  cmp r4, r1
-  bcc CopyDataInit
-  
-/* Zero fill the bss segment. */
-  ldr r2, =_sbss
-  ldr r4, =_ebss
-  movs r3, #0
-  b LoopFillZerobss
+/*
+ * TODO 1
+ * Fill this array with the ten outputs produced by YOUR Task 1 golden
+ * measure. Copy them from your own PC run, not from a friend and not from
+ * the practical sheet. The firmware self-test below compares against these.
+ */
+static const uint32_t golden_outputs[10] = {
+    0u, 1u, 3u, 4u, 63u, 255u,
+    11111u, 31426u, 65535u, 65535u
+};
 
-FillZerobss:
-  str  r3, [r2]
-  adds r2, r2, #4
+/*
+ * Results. Keep these volatile so the optimiser leaves them alone at -O1
+ * and above. Read them in the STM32CubeIDE Live Expressions view.
+ */
+volatile uint8_t  pass_all          = 0u;   /* 1 means all ten matched      */
+volatile uint32_t single_call_span  = 0u;   /* timer counts, one call       */
+volatile uint32_t long_run_span     = 0u;   /* timer counts, LONG_RUN_N     */
+volatile float    mean_us_per_call  = 0.0f; /* long run divided by N        */
 
-LoopFillZerobss:
-  cmp r2, r4
-  bcc FillZerobss
+/* Sink for the return value. Stops the optimiser deleting the call. */
+static volatile uint32_t sink = 0u;
 
-/* Call static constructors */
-  bl __libc_init_array
-/* Call the application's entry point.*/
-  bl main
+/* USER CODE END PV */
 
-LoopForever:
-    b LoopForever
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
 
+/* USER CODE BEGIN PFP */
+static void     gpio_init(void);
+static void     timing_timer_init(void);
+static uint32_t isqrt(uint32_t x);
+static uint32_t time_one_call(uint32_t x);
+static uint32_t time_n_calls(uint32_t x, uint32_t n);
+/* USER CODE END PFP */
 
-.size Reset_Handler, .-Reset_Handler
+/* USER CODE BEGIN 0 */
+
+/* ---------------------------------------------------------------------------
+ * Hardware initialisation
+ * ------------------------------------------------------------------------ */
+static void gpio_init(void)
+{
+    /*
+     * TODO 2
+     * Enable the peripheral clock for GPIOC and GPIOB.
+     *
+     * Look up the correct RCC enable register in RM0091 Section 6, Reset
+     * and Clock Control, and name the register in your report.
+     *
+     * RCC->???ENR |= ... ;
+     */
+	RCC->AHBENR |= RCC_AHBENR_GPIOBEN | RCC_AHBENR_GPIOCEN;
+
+    /*
+     * TODO 3
+     * Put PC13 and PB1 into general purpose output mode.
+     * MODER holds two bits per pin. Clear both bits first, then set the
+     * output pattern. Leave every other pin untouched.
+     */
+	GPIOB->MODER &= ~(GPIO_MODER_MODER1);	// CLEAR BOTH BITS
+	GPIOB->MODER |= (GPIO_MODER_MODER1_0); //01 = GENERAL PURPOSE OUTPUT MODE
+
+	GPIOC->MODER &= ~(GPIO_MODER_MODER13);
+	GPIOC->MODER |= (GPIO_MODER_MODER13_0);
+
+	GPIOB->MODER &= ~(GPIO_MODER_MODER5);	// CLEAR BOTH BITS
+	GPIOB->MODER |= (GPIO_MODER_MODER5_0);
+
+    /*
+     * TODO 4
+     * Set the idle states: PC13 HIGH (pulse is active low) and PB1 LOW
+     * (LED off until the self-test passes).
+     * BSRR sets a pin. BRR clears a pin.
+     */
+	GPIOC->BSRR = GPIO_BSRR_BS_13;
+	GPIOB->BRR = GPIO_BRR_BR_1;
+}
+
+static void timing_timer_init(void)
+{
+    /*
+     * TODO 5
+     * Enable the TIM16 peripheral clock. TIM16 and the GPIO ports sit on
+     * different buses on this device. Name both buses in your report.
+     */
+	RCC->APB2ENR |= RCC_APB2ENR_TIM16EN;
+
+    /*
+     * TODO 6
+     * Set the prescaler so one timer count equals a time you choose and
+     * state. The division factor is PSC + 1, so:
+     *
+     *     counter clock = timer clock / (PSC + 1)
+     *
+     * Work out the timer clock from the path HSI -> AHB prescaler ->
+     * APB prescaler -> TIM16. Write the full path and every divider into
+     * your report before you pick the number.
+     *
+     * TIM16->PSC = ??? ;
+     */
+	TIM16->PSC = 7; // 8MHz/(7+1) = 1MHz COUNTER (i.e. ONE TICK = 1 MICROSECOND
+
+    /*
+     * TODO 7
+     * Set ARR for a free running 16-bit counter, force the prescaler to
+     * load with an update event, then enable the counter.
+     */
+	TIM16->ARR = 0xFFFF;  //FREE RUNNING
+	TIM16->EGR = TIM_EGR_UG; //LATCHES PSC INTO THE ACTIVE PRESCALER (i.e. FORCES UPDATE)
+	TIM16->CR1 |= TIM_CR1_CEN;
+}
+
+/* ---------------------------------------------------------------------------
+ * Task 2 core algorithm
+ * ------------------------------------------------------------------------ */
+/*
+ * Helper. Returns non-zero when mid * mid is at or below x.
+ *
+ * Keep this as a separate function. Task 3 asks you to find one
+ * optimisation transformation in the disassembly, and the treatment of
+ * this helper at -O2 is the easiest one to spot and name.
+ *
+ * Note: mid * mid overflows 32 bits for large mid. Promote before you
+ * multiply.
+ */
+static inline uint32_t square_le(uint32_t mid, uint32_t x)
+{
+    /* TODO 8: return the comparison result. */
+    uint64_t sq = (uint64_t)mid * (uint64_t)mid;
+    return sq <= (uint64_t)x;
+}
+/*
+ * Integer square root. Returns the largest r with r * r <= x, for every
+ * x from 0 to 4294967295.
+ */
+static uint32_t isqrt(uint32_t x)
+{
+    /*
+     * TODO 9
+     * Implement a fast integer square root. A binary search over the
+     * answer range works well and is simple to reason about.
+     *
+     */
+    uint32_t low = 0;
+    uint32_t high = 65535u;
+    uint32_t ans = 0;
+    while (low <= high) {
+    	uint32_t mid = low + (high - low)/2;
+
+    	if (square_le(mid, x)) {
+    		ans = mid;
+    		low = mid + 1;
+    	} else {
+    		if (mid == 0) break; // gaurds against overflow
+    		high = mid - 1;
+    	}
+    }
+    return ans;
+}
+
+/* ---------------------------------------------------------------------------
+ * Timing harness
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Times one call.
+ * Drives PC13 LOW for the timed window so the scope pulse and the counter
+ * span cover the same code.
+ * Returns the elapsed counter span.
+ */
+static uint32_t time_one_call(uint32_t x)
+{
+    uint16_t a = 0u;
+    uint16_t b = 0u;
+
+    GPIOC->BRR = (1UL << PULSE_PIN);   /* PC13 low: pulse starts */
+
+    /* TODO 10: capture the counter into a. Which register holds the count? */
+    a = (uint16_t)TIM16->CNT;
+
+    sink = isqrt(x);                   /* the code under test */
+
+    /* TODO 11: capture the counter into b. */
+    b = (uint16_t)TIM16->CNT;
+
+    GPIOC->BSRR = (1UL << PULSE_PIN);  /* PC13 high: pulse ends */
+
+    /*
+     * TODO 12
+     * Return the elapsed span. The counter wraps at its top value during
+     * long runs, so a plain b minus a is wrong once the counter rolls over.
+     * Work out an expression correct across a wrap and explain it in your
+     * report. Test your reasoning on a = 65500, b = 20.
+     */
+    uint32_t span = 0;
+    if (b < a) {
+    	span = 65536u - (uint32_t)a + (uint32_t)b;
+    } else {
+    	span = (uint32_t)b - (uint32_t)a;
+    }
+    return span;
+}
+
+/*
+ * Times n calls back to back so the counter crosses its overflow more
+ * than once. Same arithmetic as the single call version.
+ */
+static uint32_t time_n_calls(uint32_t x, uint32_t n)
+{
+    uint16_t a = 0u;
+    uint16_t b = 0u;
+
+    GPIOC->BRR = (1UL << PULSE_PIN);
+
+    /* TODO 13: capture the counter into a. */
+    a = (uint16_t)TIM16->CNT;
+
+    for (uint32_t i = 0u; i < n; i++)
+    {
+        sink = isqrt(x);
+    }
+
+    /* TODO 14: capture the counter into b. */
+    b = (uint16_t)TIM16->CNT;
+
+    GPIOC->BSRR = (1UL << PULSE_PIN);
+
+    /*
+     * TODO 15
+     * Return the elapsed span using the same wrap-safe expression.
+     *
+     * Careful: a 16-bit counter measures a limited window without
+     * ambiguity. Work out that window from your prescaler, then pick n so
+     * the total run stays inside a single unambiguous window, or track the
+     * overflows yourself. State your choice in the report.
+     */
+    uint32_t span = 0;
+    if (b < a) {
+    	span = 65536u - (uint32_t)a + (uint32_t)b;
+    } else {
+        span = (uint32_t)b - (uint32_t)a;
+    }
+    return span;
+}
+
+/* USER CODE END 0 */
 
 /**
- * @brief  This is the code that gets called when the processor receives an
- *         unexpected interrupt.  This simply enters an infinite loop, preserving
- *         the system state for examination by a debugger.
+  * @brief  The application entry point.
+  */
+int main(void)
+{
+  /* MCU Configuration -------------------------------------------------------*/
+  HAL_Init();
+  SystemClock_Config();
+
+  /* USER CODE BEGIN 2 */
+  gpio_init();
+  timing_timer_init();
+
+  /* Self-test against the ten golden values from Task 1 */
+  pass_all = 1u;
+  for (int i = 0; i < 10; i++)
+  {
+      if (isqrt(golden_inputs[i]) != golden_outputs[i])
+      {
+          pass_all = 0u;
+          break;
+      }
+  }
+
+  /*
+   * TODO 16
+   * Drive PB1 from pass_all. LED on for a pass, off for a fail.
+   * The demonstrator checks this LED before anything else.
+   */
+  if (pass_all) {
+	  GPIOB->BSRR = (1UL << LED_PIN); // led on, i.e. test passed
+  } else {
+	  GPIOB->BRR = (1UL << LED_PIN); // led off, i.e. test failed
+  }
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  while (1)
+  {
+    /* USER CODE BEGIN 3 */
+
+    /* Task 2 and Task 3: single call measurement */
+    single_call_span = time_one_call(TEST_INPUT);
+
+    /*
+     * TODO 17
+     * Task 2 wrap case: run the long measurement, then work out the mean
+     * time per call and confirm it agrees with the single call figure.
+     *
+     * Comment this out while you place the scope cursors on the single
+     * call pulse. Two pulses of very different widths on one pin make the
+     * scope trigger jump.
+     */
+    /* long_run_span    = time_n_calls(TEST_INPUT, LONG_RUN_N); */
+    /* mean_us_per_call = ??? ; */
+
+    /*
+    long_run_span = time_n_calls(TEST_INPUT, LONG_RUN_N);
+    mean_us_per_call = long_run_span / LONG_RUN_N;
+	*/
+
+    int32_t diff = (int32_t)mean_us_per_call - (int32_t)single_call_span;
+    if (diff < 0) diff = -diff;
+    uint8_t timing_agrees = (diff <= 5u);
+
+    if (timing_agrees) {
+    	GPIOB->BSRR = (1UL << DEBUG_LED_PIN);
+    } else {
+    	GPIOB->BSRR = (1UL << DEBUG_LED_PIN + 16u);
+    }
+
+
+    /* Gap between measurements so the scope has a clean single pulse */
+    for (volatile int d = 0; d < 10000; d++)
+    {
+    }
+    /* USER CODE END 3 */
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                              | RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif /* USE_FULL_ASSERT */
+
+/*
+ * ---------------------------------------------------------------------------
+ * TASK 3 CHECKLIST. No code changes needed below this line.
+ * ---------------------------------------------------------------------------
  *
- * @param  None
- * @retval : None
-*/
-    .section .text.Default_Handler,"ax",%progbits
-Default_Handler:
-Infinite_Loop:
-  b Infinite_Loop
-  .size Default_Handler, .-Default_Handler
-/******************************************************************************
-*
-* The minimal vector table for a Cortex M0.  Note that the proper constructs
-* must be placed on this to ensure that it ends up at physical address
-* 0x0000.0000.
-*
-******************************************************************************/
-   .section .isr_vector,"a",%progbits
-  .type g_pfnVectors, %object
-  .size g_pfnVectors, .-g_pfnVectors
-
-
-g_pfnVectors:
-  .word  _estack
-  .word  Reset_Handler
-  .word  NMI_Handler
-  .word  HardFault_Handler
-  .word  0
-  .word  0
-  .word  0
-  .word  0
-  .word  0
-  .word  0
-  .word  0
-  .word  SVC_Handler
-  .word  0
-  .word  0
-  .word  PendSV_Handler
-  .word  SysTick_Handler
-  .word  WWDG_IRQHandler                   /* Window WatchDog              */
-  .word  PVD_IRQHandler                    /* PVD through EXTI Line detect */
-  .word  RTC_IRQHandler                    /* RTC through the EXTI line    */
-  .word  FLASH_IRQHandler                  /* FLASH                        */
-  .word  RCC_CRS_IRQHandler                /* RCC and CRS                  */
-  .word  EXTI0_1_IRQHandler                /* EXTI Line 0 and 1            */
-  .word  EXTI2_3_IRQHandler                /* EXTI Line 2 and 3            */
-  .word  EXTI4_15_IRQHandler               /* EXTI Line 4 to 15            */
-  .word  TSC_IRQHandler                    /* TSC                          */
-  .word  DMA1_Channel1_IRQHandler          /* DMA1 Channel 1               */
-  .word  DMA1_Channel2_3_IRQHandler        /* DMA1 Channel 2 and Channel 3 */
-  .word  DMA1_Channel4_5_IRQHandler        /* DMA1 Channel 4 and Channel 5 */
-  .word  ADC1_COMP_IRQHandler              /* ADC1, COMP1 and COMP2         */
-  .word  TIM1_BRK_UP_TRG_COM_IRQHandler    /* TIM1 Break, Update, Trigger and Commutation */
-  .word  TIM1_CC_IRQHandler                /* TIM1 Capture Compare         */
-  .word  TIM2_IRQHandler                   /* TIM2                         */
-  .word  TIM3_IRQHandler                   /* TIM3                         */
-  .word  TIM6_DAC_IRQHandler               /* TIM6 and DAC                 */
-  .word  0                                 /* Reserved                     */
-  .word  TIM14_IRQHandler                  /* TIM14                        */
-  .word  TIM15_IRQHandler                  /* TIM15                        */
-  .word  TIM16_IRQHandler                  /* TIM16                        */
-  .word  TIM17_IRQHandler                  /* TIM17                        */
-  .word  I2C1_IRQHandler                   /* I2C1                         */
-  .word  I2C2_IRQHandler                   /* I2C2                         */
-  .word  SPI1_IRQHandler                   /* SPI1                         */
-  .word  SPI2_IRQHandler                   /* SPI2                         */
-  .word  USART1_IRQHandler                 /* USART1                       */
-  .word  USART2_IRQHandler                 /* USART2                       */
-  .word  0                                 /* Reserved                     */
-  .word  CEC_CAN_IRQHandler                /* CEC and CAN                  */
-  .word  0                                 /* Reserved                     */
-
-/*******************************************************************************
-*
-* Provide weak aliases for each Exception handler to the Default_Handler.
-* As they are weak aliases, any function with the same name will override
-* this definition.
-*
-*******************************************************************************/
-
-  .weak      NMI_Handler
-  .thumb_set NMI_Handler,Default_Handler
-
-  .weak      HardFault_Handler
-  .thumb_set HardFault_Handler,Default_Handler
-
-  .weak      SVC_Handler
-  .thumb_set SVC_Handler,Default_Handler
-
-  .weak      PendSV_Handler
-  .thumb_set PendSV_Handler,Default_Handler
-
-  .weak      SysTick_Handler
-  .thumb_set SysTick_Handler,Default_Handler
-
-  .weak      WWDG_IRQHandler
-  .thumb_set WWDG_IRQHandler,Default_Handler
-
-  .weak      PVD_IRQHandler
-  .thumb_set PVD_IRQHandler,Default_Handler
-
-  .weak      RTC_IRQHandler
-  .thumb_set RTC_IRQHandler,Default_Handler
-
-  .weak      FLASH_IRQHandler
-  .thumb_set FLASH_IRQHandler,Default_Handler
-
-  .weak      RCC_CRS_IRQHandler
-  .thumb_set RCC_CRS_IRQHandler,Default_Handler
-
-  .weak      EXTI0_1_IRQHandler
-  .thumb_set EXTI0_1_IRQHandler,Default_Handler
-
-  .weak      EXTI2_3_IRQHandler
-  .thumb_set EXTI2_3_IRQHandler,Default_Handler
-
-  .weak      EXTI4_15_IRQHandler
-  .thumb_set EXTI4_15_IRQHandler,Default_Handler
-
-  .weak      TSC_IRQHandler
-  .thumb_set TSC_IRQHandler,Default_Handler
-
-  .weak      DMA1_Channel1_IRQHandler
-  .thumb_set DMA1_Channel1_IRQHandler,Default_Handler
-
-  .weak      DMA1_Channel2_3_IRQHandler
-  .thumb_set DMA1_Channel2_3_IRQHandler,Default_Handler
-
-  .weak      DMA1_Channel4_5_IRQHandler
-  .thumb_set DMA1_Channel4_5_IRQHandler,Default_Handler
-
-  .weak      ADC1_COMP_IRQHandler
-  .thumb_set ADC1_COMP_IRQHandler,Default_Handler
-
-  .weak      TIM1_BRK_UP_TRG_COM_IRQHandler
-  .thumb_set TIM1_BRK_UP_TRG_COM_IRQHandler,Default_Handler
-
-  .weak      TIM1_CC_IRQHandler
-  .thumb_set TIM1_CC_IRQHandler,Default_Handler
-
-  .weak      TIM2_IRQHandler
-  .thumb_set TIM2_IRQHandler,Default_Handler
-
-  .weak      TIM3_IRQHandler
-  .thumb_set TIM3_IRQHandler,Default_Handler
-
-  .weak      TIM6_DAC_IRQHandler
-  .thumb_set TIM6_DAC_IRQHandler,Default_Handler
-
-  .weak      TIM14_IRQHandler
-  .thumb_set TIM14_IRQHandler,Default_Handler
-
-  .weak      TIM15_IRQHandler
-  .thumb_set TIM15_IRQHandler,Default_Handler
-
-  .weak      TIM16_IRQHandler
-  .thumb_set TIM16_IRQHandler,Default_Handler
-
-  .weak      TIM17_IRQHandler
-  .thumb_set TIM17_IRQHandler,Default_Handler
-
-  .weak      I2C1_IRQHandler
-  .thumb_set I2C1_IRQHandler,Default_Handler
-
-  .weak      I2C2_IRQHandler
-  .thumb_set I2C2_IRQHandler,Default_Handler
-
-  .weak      SPI1_IRQHandler
-  .thumb_set SPI1_IRQHandler,Default_Handler
-
-  .weak      SPI2_IRQHandler
-  .thumb_set SPI2_IRQHandler,Default_Handler
-
-  .weak      USART1_IRQHandler
-  .thumb_set USART1_IRQHandler,Default_Handler
-
-  .weak      USART2_IRQHandler
-  .thumb_set USART2_IRQHandler,Default_Handler
-
-  .weak      CEC_CAN_IRQHandler
-  .thumb_set CEC_CAN_IRQHandler,Default_Handler
+ * Build this same file four times, once per optimisation level.
+ *
+ *   Project > Properties > C/C++ Build > Settings > MCU GCC Compiler
+ *     > Optimization > Optimization Level
+ *
+ *   None            -O0
+ *   Optimize        -O1
+ *   Optimize more   -O2
+ *   Optimize size   -Os
+ *
+ * At every level record:
+ *   1. Text size in bytes. Build Analyzer tab, or run
+ *        arm-none-eabi-size Debug/Practical1B.elf
+ *   2. single_call_span from Live Expressions.
+ *   3. The PC13 pulse width from the scope, with cursors.
+ *
+ * At -O2 also dump the disassembly of your isqrt function:
+ *        arm-none-eabi-objdump -d Debug/Practical1B.elf > disasm_O2.txt
+ *   or open Debug/Practical1B.list, which the build already produces.
+ * Find one transformation the compiler applied, name it, and point at the
+ * source lines above it acts on.
+ * ---------------------------------------------------------------------------
+ */
